@@ -34,25 +34,29 @@ struct {
 SEC("tc")
 int test(struct __sk_buff *skb)
 {
-	struct skb_meta meta = {};
-	meta.address = (u64)skb;
-	meta.len = skb->len;
-	meta.pkt_type = skb->pkt_type;
-	meta.mark = skb->mark;
-	meta.queue_mapping = skb->queue_mapping;
-	meta.protocol = skb->protocol;
-	meta.vlan_present = skb->vlan_present;
-	meta.vlan_tci = skb->vlan_tci;
-	meta.vlan_proto = skb->vlan_proto;
-	meta.priority = skb->priority;
-	meta.ingress_ifindex = skb->ingress_ifindex;
-	meta.ifindex = skb->ifindex;
-	meta.tc_index = skb->tc_index;
-	meta.cb[0] = skb->cb[0];
-	meta.cb[1] = skb->cb[1];
-	meta.cb[2] = skb->cb[2];
-	meta.cb[3] = skb->cb[3];
-	meta.cb[4] = skb->cb[4];
-	bpf_ringbuf_output(&meta_ringbuf, &meta, sizeof(meta), BPF_RB_NO_WAKEUP);
+	struct skb_meta *meta = (struct skb_meta *)bpf_ringbuf_reserve(&meta_ringbuf, sizeof(struct skb_meta), 0);
+	if (!meta)
+		return 0;
+
+	meta->address = (u64)skb;
+	meta->len = skb->len;
+	meta->pkt_type = skb->pkt_type;
+	meta->mark = skb->mark;
+	meta->queue_mapping = skb->queue_mapping;
+	meta->protocol = skb->protocol;
+	meta->vlan_present = skb->vlan_present;
+	meta->vlan_tci = skb->vlan_tci;
+	meta->vlan_proto = skb->vlan_proto;
+	meta->priority = skb->priority;
+	meta->ingress_ifindex = skb->ingress_ifindex;
+	meta->ifindex = skb->ifindex;
+	meta->tc_index = skb->tc_index;
+	meta->cb[0] = skb->cb[0];
+	meta->cb[1] = skb->cb[1];
+	meta->cb[2] = skb->cb[2];
+	meta->cb[3] = skb->cb[3];
+	meta->cb[4] = skb->cb[4];
+
+	bpf_ringbuf_submit(meta, BPF_RB_NO_WAKEUP);
 	return 0;
 }
