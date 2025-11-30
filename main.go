@@ -52,20 +52,33 @@ func main() {
 			totalBytes, *events, recordBytes, reader.BufferSize())
 	}
 
-	if err := runBatch(obj.Test, make([]byte, packetDataSize), *events); err != nil {
-		log.Fatalf("run bpf program: %v", err)
+	packet := make([]byte, packetDataSize)
+
+	copyDur, copyCount, copyChecksum, err := benchmark("read-into (copy)", reader, obj.Test, packet, *events, *timeout, consumeRingbufCopy)
+	if err != nil {
+		log.Fatalf("copy benchmark: %v", err)
 	}
 
+	zeroDur, zeroCount, zeroChecksum, err := benchmark("read-view (zero-copy)", reader, obj.Test, packet, *events, *timeout, consumeRingbufView)
+	if err != nil {
+		log.Fatalf("zero-copy benchmark: %v", err)
+	}
+
+	fmt.Printf("read-into (copy):     %d events in %s (%.2f Mevents/s), checksum=%d\n",
+		copyCount, copyDur, float64(copyCount)/copyDur.Seconds()/1e6, copyChecksum)
+	fmt.Printf("read-view (zero-copy): %d events in %s (%.2f Mevents/s), checksum=%d\n",
+		zeroCount, zeroDur, float64(zeroCount)/zeroDur.Seconds()/1e6, zeroChecksum)
+}
+
+func benchmark(name string, reader *ringbuf.Reader, prog *ebpf.Program, packet []byte, events int, timeout time.Duration, consume func(*ringbuf.Reader, int, time.Duration) (int, uint64, error)) (time.Duration, int, uint64, error) {
+	if err := runBatch(prog, packet, events); err != nil {
+		return 0, 0, 0, fmt.Errorf("%s: run bpf: %w", name, err)
+	}
+
+	reader.SetDeadline(time.Time{}) // clear any previous deadline
 	start := time.Now()
-	received, checksum, consumeErr := consumeRingbuf(reader, *events, *timeout)
-	duration := time.Since(start)
-
-	if consumeErr != nil {
-		log.Fatalf("consume ringbuf: %v", consumeErr)
-	}
-
-	fmt.Printf("parsed %d events in %s (%.2f Mevents/s)\n", received, duration, float64(received)/duration.Seconds()/1e6)
-	fmt.Printf("checksum: %d\n", checksum)
+	count, checksum, err := consume(reader, events, timeout)
+	return time.Since(start), count, checksum, err
 }
 
 func runBatch(prog *ebpf.Program, packet []byte, repeat int) error {
@@ -86,7 +99,7 @@ func runBatch(prog *ebpf.Program, packet []byte, repeat int) error {
 	return err
 }
 
-func consumeRingbuf(reader *ringbuf.Reader, expected int, timeout time.Duration) (int, uint64, error) {
+func consumeRingbufCopy(reader *ringbuf.Reader, expected int, timeout time.Duration) (int, uint64, error) {
 	if reader == nil {
 		return 0, 0, fmt.Errorf("nil ringbuf reader")
 	}
@@ -115,6 +128,45 @@ func consumeRingbuf(reader *ringbuf.Reader, expected int, timeout time.Duration)
 		meta := *(*skbMeta)(unsafe.Pointer(&rec.RawSample[0]))
 		checksum += sumMeta(&meta)
 		count++
+	}
+
+	return count, checksum, nil
+}
+
+func consumeRingbufView(reader *ringbuf.Reader, expected int, timeout time.Duration) (int, uint64, error) {
+	if reader == nil {
+		return 0, 0, fmt.Errorf("nil ringbuf reader")
+	}
+
+	var view ringbuf.View
+	var count int
+	var checksum uint64
+
+	for count < expected {
+		reader.SetDeadline(time.Now().Add(timeout))
+
+		if err := reader.ReadViewInto(&view); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				return count, checksum, fmt.Errorf("timeout waiting for events: received %d/%d", count, expected)
+			}
+			if errors.Is(err, ringbuf.ErrClosed) || errors.Is(err, ringbuf.ErrFlushed) {
+				continue
+			}
+			return count, checksum, fmt.Errorf("ringbuf read view: %w", err)
+		}
+
+		if len(view.Sample) < metaSize {
+			_ = view.Release()
+			return count, checksum, fmt.Errorf("short sample: got %d bytes, expected at least %d", len(view.Sample), metaSize)
+		}
+
+		meta := *(*skbMeta)(unsafe.Pointer(&view.Sample[0]))
+		checksum += sumMeta(&meta)
+		count++
+
+		if err := view.Release(); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
+			return count, checksum, fmt.Errorf("release view: %w", err)
+		}
 	}
 
 	return count, checksum, nil
