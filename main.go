@@ -30,6 +30,7 @@ const metaSize = int(unsafe.Sizeof(skbMeta{}))
 func main() {
 	events := flag.Int("n", defaultEvents, "number of ringbuf events to generate and parse")
 	timeout := flag.Duration("read-timeout", readTimeout, "per-read timeout when waiting for ringbuf data")
+	mode := flag.String("mode", "both", "benchmark mode: copy | view | both")
 	flag.Parse()
 
 	if *events <= 0 {
@@ -54,20 +55,30 @@ func main() {
 
 	packet := make([]byte, packetDataSize)
 
-	copyDur, copyCount, copyChecksum, err := benchmark("read-into (copy)", reader, obj.Test, packet, *events, *timeout, consumeRingbufCopy)
-	if err != nil {
-		log.Fatalf("copy benchmark: %v", err)
+	runCopy := *mode == "copy" || *mode == "both"
+	runView := *mode == "view" || *mode == "both"
+
+	if !runCopy && !runView {
+		log.Fatalf("invalid -mode %q (must be copy | view | both)", *mode)
 	}
 
-	zeroDur, zeroCount, zeroChecksum, err := benchmark("read-view (zero-copy)", reader, obj.Test, packet, *events, *timeout, consumeRingbufView)
-	if err != nil {
-		log.Fatalf("zero-copy benchmark: %v", err)
+	if runCopy {
+		copyDur, copyCount, copyChecksum, err := benchmark("read-into (copy)", reader, obj.Test, packet, *events, *timeout, consumeRingbufCopy)
+		if err != nil {
+			log.Fatalf("copy benchmark: %v", err)
+		}
+		fmt.Printf("read-into (copy):     %d events in %s (%.2f Mevents/s), checksum=%d\n",
+			copyCount, copyDur, float64(copyCount)/copyDur.Seconds()/1e6, copyChecksum)
 	}
 
-	fmt.Printf("read-into (copy):     %d events in %s (%.2f Mevents/s), checksum=%d\n",
-		copyCount, copyDur, float64(copyCount)/copyDur.Seconds()/1e6, copyChecksum)
-	fmt.Printf("read-view (zero-copy): %d events in %s (%.2f Mevents/s), checksum=%d\n",
-		zeroCount, zeroDur, float64(zeroCount)/zeroDur.Seconds()/1e6, zeroChecksum)
+	if runView {
+		zeroDur, zeroCount, zeroChecksum, err := benchmark("read-view (zero-copy)", reader, obj.Test, packet, *events, *timeout, consumeRingbufView)
+		if err != nil {
+			log.Fatalf("zero-copy benchmark: %v", err)
+		}
+		fmt.Printf("read-view (zero-copy): %d events in %s (%.2f Mevents/s), checksum=%d\n",
+			zeroCount, zeroDur, float64(zeroCount)/zeroDur.Seconds()/1e6, zeroChecksum)
+	}
 }
 
 func benchmark(name string, reader *ringbuf.Reader, prog *ebpf.Program, packet []byte, events int, timeout time.Duration, consume func(*ringbuf.Reader, int, time.Duration) (int, uint64, error)) (time.Duration, int, uint64, error) {
@@ -109,7 +120,9 @@ func consumeRingbufCopy(reader *ringbuf.Reader, expected int, timeout time.Durat
 	var checksum uint64
 
 	for count < expected {
-		reader.SetDeadline(time.Now().Add(timeout))
+		if rec.Remaining <= 0 {
+			reader.SetDeadline(time.Now().Add(timeout))
+		}
 
 		if err := reader.ReadInto(&rec); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
@@ -121,12 +134,12 @@ func consumeRingbufCopy(reader *ringbuf.Reader, expected int, timeout time.Durat
 			return count, checksum, fmt.Errorf("ringbuf read: %w", err)
 		}
 
-		if len(rec.RawSample) < metaSize {
+		if len(rec.RawSample) != metaSize {
 			return count, checksum, fmt.Errorf("short sample: got %d bytes, expected at least %d", len(rec.RawSample), metaSize)
 		}
 
-		meta := *(*skbMeta)(unsafe.Pointer(&rec.RawSample[0]))
-		checksum += sumMeta(&meta)
+		meta := (*skbMeta)(unsafe.Pointer(&rec.RawSample[0]))
+		checksum += sumMeta(meta)
 		count++
 	}
 
@@ -143,9 +156,11 @@ func consumeRingbufView(reader *ringbuf.Reader, expected int, timeout time.Durat
 	var checksum uint64
 
 	for count < expected {
-		reader.SetDeadline(time.Now().Add(timeout))
+		if view.Remaining <= 0 {
+			reader.SetDeadline(time.Now().Add(5 * time.Millisecond))
+		}
 
-		if err := reader.ReadViewInto(&view); err != nil {
+		if err := reader.PeekInto(&view); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				return count, checksum, fmt.Errorf("timeout waiting for events: received %d/%d", count, expected)
 			}
@@ -155,18 +170,17 @@ func consumeRingbufView(reader *ringbuf.Reader, expected int, timeout time.Durat
 			return count, checksum, fmt.Errorf("ringbuf read view: %w", err)
 		}
 
-		if len(view.Sample) < metaSize {
-			_ = view.Release()
+		if len(view.Sample) != metaSize {
+			reader.Consume(&view)
+
 			return count, checksum, fmt.Errorf("short sample: got %d bytes, expected at least %d", len(view.Sample), metaSize)
 		}
 
-		meta := *(*skbMeta)(unsafe.Pointer(&view.Sample[0]))
-		checksum += sumMeta(&meta)
+		meta := (*skbMeta)(unsafe.Pointer(&view.Sample[0]))
+		checksum += sumMeta(meta)
 		count++
 
-		if err := view.Release(); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
-			return count, checksum, fmt.Errorf("release view: %w", err)
-		}
+		reader.Consume(&view)
 	}
 
 	return count, checksum, nil
@@ -174,7 +188,7 @@ func consumeRingbufView(reader *ringbuf.Reader, expected int, timeout time.Durat
 
 func sumMeta(m *skbMeta) uint64 {
 	var s uint64
-	s += m.Address
+	s += uint64(m.Address)
 	s += uint64(m.Len)
 	s += uint64(m.PktType)
 	s += uint64(m.Mark)
@@ -187,8 +201,8 @@ func sumMeta(m *skbMeta) uint64 {
 	s += uint64(m.IngressIfindex)
 	s += uint64(m.Ifindex)
 	s += uint64(m.TcIndex)
-	for _, v := range m.Cb {
-		s += uint64(v)
+	for _, cb := range m.Cb {
+		s += uint64(cb)
 	}
 	return s
 }

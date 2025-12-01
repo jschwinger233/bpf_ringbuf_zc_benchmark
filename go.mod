@@ -6,4 +6,4 @@ require github.com/cilium/ebpf v0.20.0
 
 require golang.org/x/sys v0.37.0 // indirect
 
-replace github.com/cilium/ebpf => github.com/jschwinger233/ebpf v0.9.2-0.20251130093829-0236b1f2b7d9
+replace github.com/cilium/ebpf => /home/gray/src/github.com/cilium/ebpf
