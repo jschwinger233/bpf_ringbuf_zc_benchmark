@@ -16,7 +16,12 @@ import (
 type TestEvent struct {
 	_    structs.HostLayout
 	Skb  uint64
-	Data [1024]uint8
+	Data [0]uint8
+}
+
+type TestParameters struct {
+	_        structs.HostLayout
+	DataSize uint16
 }
 
 // LoadTest returns the embedded CollectionSpec for Test.
@@ -75,6 +80,7 @@ type TestMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TestVariableSpecs struct {
+	PARAM              *ebpf.VariableSpec `ebpf:"PARAM"`
 	*ebpf.VariableSpec `ebpf:"_"`
 }
 
@@ -111,6 +117,7 @@ func (m *TestMaps) Close() error {
 //
 // It can be passed to LoadTestObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TestVariables struct {
+	PARAM          *ebpf.Variable `ebpf:"PARAM"`
 	*ebpf.Variable `ebpf:"_"`
 }
 
