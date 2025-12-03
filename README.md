@@ -1,49 +1,81 @@
 # bpf_ringbuf_zc_benchmark
 
-Micro-benchmark comparing the current ringbuf read path in `cilium/ebpf` (copying into a user buffer) against a proposed zero-copy view API. The BPF program emits skb metadata into a large ring buffer; user space loads the program and repeatedly drains the buffer using either approach.
+Micro-benchmark that compares two ring buffer read paths in `cilium/ebpf`:
+
+- **copy**: `ringbuf.Reader.ReadInto` copies each record into a user buffer.
+- **zero-copy view**: `ringbuf.Reader.PeekInto` returns a view which is consumed with `Reader.Consume`.
+
+The BPF program in `bpf/test.c` writes `struct event { u64 skb; u8 data[]; }` into a 1 GiB ring buffer. User space calls `Program.Run` once per benchmark to generate a full ring of events, then drains it with the selected path.
 
 ## Prerequisites
-- Go 1.24+ (matches `go.mod`).
-- Clang/LLVM (for `go generate ./bpf` if you need to recompile the BPF object).
-- Linux kernel with BPF ring buffer support (5.8+) and permission to load BPF programs (root or `CAP_BPF`/`CAP_PERFMON`).
-- A fork of `github.com/cilium/ebpf` that contains the zero-copy ringbuf API prototype (see https://github.com/jschwinger233/ebpf/pull/1). Point the `replace` directive in `go.mod` at your local checkout, e.g.
-
-  ```
-  replace github.com/cilium/ebpf => /path/to/your/ebpf
-  ```
+- Go 1.24+.
+- Clang/LLVM (only needed if you recompile the BPF object via `go generate`).
+- Linux kernel 5.8+ with BPF ring buffer support and permission to load BPF (`root` or `CAP_BPF`/`CAP_PERFMON`).
+- At least 1 GiB of locked memory for the ring buffer map. If you see `memlock`/`EPERM`, run `ulimit -l unlimited` or execute the binary with `sudo`.
+- A build of `github.com/cilium/ebpf` that includes the zero-copy ringbuf API. Point the `replace` directive in `go.mod` at your local checkout (e.g. `replace github.com/cilium/ebpf => /path/to/ebpf`).
 
 ## Build
-1) (Optional) Regenerate the eBPF object after changing `bpf/test.c`:
-   ```
+1) (Optional) Regenerate the BPF object after editing `bpf/test.c`:
+
+   ```bash
    go generate ./bpf
    ```
-2) Build the benchmark binary:
-   ```
+
+2) Build the benchmark:
+
+   ```bash
    go build
    ```
 
+The binary is `./bpf_ringbuf_zc_benchmark`.
+
+## Benchmark knobs
+- **Ring buffer size**: 1<<30 bytes (set in `bpf/test.c`). This memory is charged against your memlock limit.
+- **`-event-size`** *(bytes, default 128)*: total size of each record emitted by BPF, including the 8-byte `skb` field. Payload bytes = `event-size - 8`.
+- **`-mode`** *(copy|view|both, default both)*: choose which user-space path to run.
+- **Event count per run**: derived from the ring size, not a flag. The program computes
+
+  `events = ring_size / (align(event_size, 8) + ring_header)`
+
+  where `ring_header` is 8 bytes. Examples:
+  - 128 B events -> ~7.9 M records per run.
+  - 512 B events -> ~2.1 M records per run.
+  - 2048 B events -> ~0.52 M records per run.
+
+The benchmark fills the ring once (via `Program.Run`) and immediately drains it, printing throughput and a checksum for each path.
+
 ## Running
-Key flags:
-- `-n` number of ringbuf events to produce (default 50,000).
-- `-mode` `copy|view|both` to choose the code path under test (default `both`).
-- `-read-timeout` per-read timeout while waiting for ringbuf data.
+For stable numbers pin to one CPU and run as root/capable user:
 
-Example run pinned to CPU 2 for stability:
-
-```
-sudo taskset -c 2 ./bpf_ringbuf_zc_benchmark -n 1999999 -read-timeout 0ms -mode both
+```bash
+sudo taskset -c 2 ./bpf_ringbuf_zc_benchmark -mode both -event-size 128
 ```
 
-Sample output (from the numbers in `perf.data`):
+To sweep payload sizes (this produced `result.txt`):
 
+```bash
+for i in {5..128}; do
+  bytes=$((i * 16))
+  echo "${bytes} bytes"
+  sudo taskset -c 2 ./bpf_ringbuf_zc_benchmark -mode both -event-size "$bytes"
+done > result.txt
 ```
-read-into (copy):     1999999 events in 47.518618ms (42.09 Mevents/s), checksum=9992853683739462143
-read-view (zero-copy): 1999999 events in 41.877471ms (47.76 Mevents/s), checksum=9992853672987467519
-```
 
-In this run the zero-copy API improved throughput from 42.09 to 47.76 Mevents/s (~13.4%). Absolute numbers depend on CPU pinning, IRQ noise, and ring size (`meta_ringbuf` is 512 MiB by default).
+No network attachment is required; the program uses `BPF_PROG_TEST_RUN` via `Program.Run` with the synthetic packet blob provided by user space.
 
-## How it works
-- `bpf/test.c` (section `tc`) writes a fixed skb metadata struct into a ring buffer sized at `1<<29` bytes.
-- `main.go` loads the object, executes the BPF program with `Program.Run` to generate `-n` events, then drains the ring buffer either via `Reader.ReadInto` (copy) or `Reader.PeekInto` + `Consume` (view / zero-copy).
-- Checksums over the struct fields ensure both paths observe identical data.
+## Latest results (from `result.txt`)
+Single-core run on CPU 2, ring size 1 GiB, Go 1.24.4. Throughput is in million events/second (Mev/s); "speedup" is zero-copy / copy.
+
+| event-size (B) | events/run | copy (Mev/s) | zero-copy (Mev/s) | speedup |
+| --- | --- | --- | --- | --- |
+| 128 | 7,895,160 | 45.63 | 49.83 | 1.09x |
+| 512 | 2,064,888 | 25.03 | 34.94 | 1.40x |
+| 1024 | 1,040,447 | 8.90 | 34.94 | 3.93x |
+| 2048 | 522,247 | 4.57 | 29.56 | 6.47x |
+
+Observations from the full sweep (80 B-2 KiB payloads):
+- Minimum speedup was ~1.07x (at 144 B records); maximum was 6.47x (at 2048 B).
+- Average speedup across all sizes: ~3.5x.
+- Zero-copy advantage grows with larger records because copy throughput falls while view throughput stays roughly flat.
+
+Use `-mode view` or `-mode copy` if you only need one path. The printed checksums should match between modes; a mismatch indicates data corruption.
