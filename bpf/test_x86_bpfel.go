@@ -13,23 +13,10 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type TestSkbMeta struct {
-	_              structs.HostLayout
-	Address        uint64
-	Len            uint32
-	PktType        uint32
-	Mark           uint32
-	QueueMapping   uint32
-	Protocol       uint32
-	VlanPresent    uint32
-	VlanTci        uint32
-	VlanProto      uint32
-	Priority       uint32
-	IngressIfindex uint32
-	Ifindex        uint32
-	TcIndex        uint32
-	Cb             [5]uint32
-	_              [4]byte
+type TestEvent struct {
+	_    structs.HostLayout
+	Skb  uint64
+	Data [1024]uint8
 }
 
 // LoadTest returns the embedded CollectionSpec for Test.

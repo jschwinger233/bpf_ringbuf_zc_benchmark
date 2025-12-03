@@ -23,9 +23,9 @@ const (
 	recordAlign    = 8 // ringbuf records are 8-byte aligned
 )
 
-type skbMeta = bpf.TestSkbMeta
+type Event = bpf.TestEvent
 
-const metaSize = int(unsafe.Sizeof(skbMeta{}))
+const eventSize = int(unsafe.Sizeof(Event{}))
 
 func main() {
 	events := flag.Int("n", defaultEvents, "number of ringbuf events to generate and parse")
@@ -46,7 +46,7 @@ func main() {
 	}
 	defer reader.Close()
 
-	recordBytes := aligned(metaSize, recordAlign) + ringHeaderSize
+	recordBytes := aligned(eventSize, recordAlign) + ringHeaderSize
 	totalBytes := *events * recordBytes
 	if totalBytes > reader.BufferSize() {
 		log.Fatalf("ringbuf too small: need %d bytes (%d events * %d bytes) but buffer has %d bytes",
@@ -134,12 +134,12 @@ func consumeRingbufCopy(reader *ringbuf.Reader, expected int, timeout time.Durat
 			return count, checksum, fmt.Errorf("ringbuf read: %w", err)
 		}
 
-		if len(rec.RawSample) != metaSize {
-			return count, checksum, fmt.Errorf("short sample: got %d bytes, expected at least %d", len(rec.RawSample), metaSize)
+		if len(rec.RawSample) != eventSize {
+			return count, checksum, fmt.Errorf("short sample: got %d bytes, expected at least %d", len(rec.RawSample), eventSize)
 		}
 
-		meta := (*skbMeta)(unsafe.Pointer(&rec.RawSample[0]))
-		checksum += sumMeta(meta)
+		event := (*Event)(unsafe.Pointer(&rec.RawSample[0]))
+		checksum += event.Skb
 		count++
 	}
 
@@ -170,41 +170,20 @@ func consumeRingbufView(reader *ringbuf.Reader, expected int, timeout time.Durat
 			return count, checksum, fmt.Errorf("ringbuf read view: %w", err)
 		}
 
-		if len(view.Sample) != metaSize {
+		if len(view.Sample) != eventSize {
 			reader.Consume(&view)
 
-			return count, checksum, fmt.Errorf("short sample: got %d bytes, expected at least %d", len(view.Sample), metaSize)
+			return count, checksum, fmt.Errorf("short sample: got %d bytes, expected at least %d", len(view.Sample), eventSize)
 		}
 
-		meta := (*skbMeta)(unsafe.Pointer(&view.Sample[0]))
-		checksum += sumMeta(meta)
+		event := (*Event)(unsafe.Pointer(&view.Sample[0]))
+		checksum += event.Skb
 		count++
 
 		reader.Consume(&view)
 	}
 
 	return count, checksum, nil
-}
-
-func sumMeta(m *skbMeta) uint64 {
-	var s uint64
-	s += uint64(m.Address)
-	s += uint64(m.Len)
-	s += uint64(m.PktType)
-	s += uint64(m.Mark)
-	s += uint64(m.QueueMapping)
-	s += uint64(m.Protocol)
-	s += uint64(m.VlanPresent)
-	s += uint64(m.VlanTci)
-	s += uint64(m.VlanProto)
-	s += uint64(m.Priority)
-	s += uint64(m.IngressIfindex)
-	s += uint64(m.Ifindex)
-	s += uint64(m.TcIndex)
-	for _, cb := range m.Cb {
-		s += uint64(cb)
-	}
-	return s
 }
 
 func aligned(n, alignment int) int {
